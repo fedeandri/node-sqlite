@@ -1,48 +1,82 @@
-import sqlite3 from 'sqlite3';
-import { open } from 'sqlite';
+import Database from 'better-sqlite3';
 import os from 'os';
 import fs from 'fs';
 
 let db;
+const databaseFile = 'database.sqlite';
+const maxCacheSeconds = 300;
+const maxSecondsPerTest = 3;
 
-async function initDatabase() {
-    db = await open({
-        filename: 'database.sqlite',
-        driver: sqlite3.verbose().Database
-    });
+function initDatabase() {
+    db = new Database(databaseFile);
 
     // Enable Write-Ahead Logging for better concurrency and performance
-    await db.run('PRAGMA journal_mode = WAL');
-    // Set cache size to approximately 10MB (-10000 pages, where each page is 1KB)
-    await db.run('PRAGMA cache_size = -10000');
+    db.pragma('journal_mode = WAL');
+    // Increase cache size to approximately 100MB (-25000 pages, where each page is 4KB)
+    db.pragma('cache_size = -25000');
     // Set synchronous mode to NORMAL for a balance between safety and performance
-    await db.run('PRAGMA synchronous = NORMAL');
+    // Set synchronous mode to FULL for maximum durability at the cost of performance
+    db.pragma('synchronous = NORMAL');
     // Store temporary tables and indices in memory instead of on disk
-    await db.run('PRAGMA temp_store = MEMORY');
+    db.pragma('temp_store = MEMORY');
     // Set the maximum size of the memory-mapped I/O to approximately 1GB
-    await db.run('PRAGMA mmap_size = 1000000000');
+    db.pragma('mmap_size = 1000000000');
+    // Enable foreign key constraints for data integrity
+    db.pragma('foreign_keys = true');
+    // Set a busy timeout of 5 seconds to wait if the database is locked
+    db.pragma('busy_timeout = 5000');
+    // Enable incremental vacuuming to reclaim unused space and keep the database file size optimized
+    db.pragma('auto_vacuum = INCREMENTAL');
 
-    await db.run('CREATE TABLE IF NOT EXISTS test_results_cache (id INTEGER PRIMARY KEY AUTOINCREMENT, result TEXT NOT NULL, timestamp INTEGER NOT NULL)');
-    await db.run('CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY AUTOINCREMENT, author TEXT NOT NULL, content TEXT NOT NULL, test_session TEXT NOT NULL, timestamp INTEGER NOT NULL)');
+    // Use STRICT on table creation for better data integrity
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS test_results_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            result TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
+        ) STRICT
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_test_results_cache_timestamp ON test_results_cache (timestamp)`);
+
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author TEXT NOT NULL,
+            content TEXT NOT NULL,
+            test_session TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
+        ) STRICT
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_comments_timestamp ON comments (timestamp)`);
 }
 
-async function getCachedTest() {
+// Not necessary with "PRAGMA auto_vacuum = INCREMENTAL" enabled
+// function performIncrementalVacuum() {
+//     try {
+//         // reclaims unused space and keeps the database file size optimized 
+//         db.pragma('incremental_vacuum');
+//     } catch (error) {
+//         console.error('Error during incremental vacuum:', error);
+//     }
+// }
+
+function getCachedTest() {
     try {
-        await initDatabase();
+        initDatabase();
 
-        const cachedResult = await db.get('SELECT * FROM test_results_cache ORDER BY timestamp DESC LIMIT 1');
+        const cachedResult = db.prepare('SELECT * FROM test_results_cache ORDER BY timestamp DESC LIMIT 1').get();
 
-        if (cachedResult && (Date.now() / 1000 - cachedResult.timestamp < 300)) {
+        if (cachedResult && (Date.now() / 1000 - cachedResult.timestamp < maxCacheSeconds)) {
             return JSON.parse(cachedResult.result);
         }
 
-        const testResult = await runTest();
+        const testResult = runTest();
 
         // Delete all older records
-        await db.run('DELETE FROM test_results_cache');
+        db.prepare('DELETE FROM test_results_cache').run();
 
         // Store the new result in the database
-        await db.run('INSERT INTO test_results_cache (result, timestamp) VALUES (?, ?)', [JSON.stringify(testResult), Math.floor(Date.now() / 1000)]);
+        db.prepare('INSERT INTO test_results_cache (result, timestamp) VALUES (?, ?)').run(JSON.stringify(testResult), Math.floor(Date.now() / 1000));
 
         return testResult;
     } catch (error) {
@@ -50,84 +84,98 @@ async function getCachedTest() {
     }
 }
 
-async function runTest() {
-    const startTime = Date.now();
-    const maxDuration = 5000; // Maximum test duration in milliseconds
-    const chunkSize = 10;
-    let writes = 0;
-    let failures = 0;
-    const newRecords = [];
-
+function runTest() {
+    const maxDuration = maxSecondsPerTest; // Maximum test duration in seconds
+    const chunkSize = 100;
     const testSessionId = `test_${Date.now()}`;
     const currentTimestamp = Math.floor(Date.now() / 1000);
 
-    const stmt = await db.prepare('INSERT INTO comments (author, content, test_session, timestamp) VALUES (?, ?, ?, ?)');
+    // Prepare statements
+    const insertStmt = db.prepare('INSERT INTO comments (author, content, test_session, timestamp) VALUES (?, ?, ?, ?)');
+    const selectStmt = db.prepare('SELECT * FROM comments WHERE id = ?');
+    const updateStmt = db.prepare('UPDATE comments SET content = ? WHERE id = ?');
+    const deleteStmt = db.prepare('DELETE FROM comments WHERE id = ?');
 
-    while (Date.now() - startTime < maxDuration) {
-        const values = [];
-        for (let j = 0; j < chunkSize; j++) {
-            values.push({
-                author: Math.random().toString(36).substring(7),
-                content: Math.random().toString(36).substring(7),
-            });
-        }
-
-        await db.run('BEGIN TRANSACTION');
-        for (const value of values) {
-            try {
-                const result = await stmt.run(value.author, value.content, testSessionId, currentTimestamp);
-                newRecords.push(result.lastID);
+    // Write test
+    const writeStart = Date.now() / 1000;
+    let writes = 0;
+    const newRecords = [];
+    while ((Date.now() / 1000) - writeStart < maxDuration) {
+        db.transaction(() => {
+            for (let j = 0; j < chunkSize; j++) {
+                const author = Math.random().toString(36).substring(2, 2 + Math.floor(Math.random() * 16) + 5);
+                const content = Math.random().toString(36).substring(2, 2 + Math.floor(Math.random() * 91) + 10);
+                const result = insertStmt.run(author, content, testSessionId, currentTimestamp);
+                newRecords.push(result.lastInsertRowid);
                 writes++;
-            } catch (error) {
-                failures++;
             }
-        }
-        await db.run('COMMIT');
-
-        if (Date.now() - startTime >= maxDuration) {
-            break;
-        }
+        })();
     }
-
-    await stmt.finalize();
-
-    const writeTime = (Date.now() - startTime) / 1000;
+    const writeTime = (Date.now() / 1000) - writeStart;
     const writesPerSecond = Math.round(writes / writeTime);
 
-    const readStart = Date.now();
-    const readSampleSize = Math.min(10000, newRecords.length);
-    const readSample = newRecords.sort(() => 0.5 - Math.random()).slice(0, readSampleSize);
-    const readStmt = await db.prepare('SELECT * FROM comments WHERE id = ?');
-    for (const id of readSample) {
-        await readStmt.get(id);
+    // Read test
+    const readStart = Date.now() / 1000;
+    let reads = 0;
+    let readDuration = 0;
+    while (readDuration < maxDuration) {
+        const id = newRecords[Math.floor(Math.random() * newRecords.length)];
+        selectStmt.get(id);
+        reads++;
+        readDuration = (Date.now() / 1000) - readStart;
     }
-    await readStmt.finalize();
-    const readTime = (Date.now() - readStart) / 1000;
-    const readsPerSecond = Math.round((readSampleSize / readTime) * (newRecords.length / readSampleSize));
+    const readsPerSecond = Math.round(reads / readDuration);
 
-    const total = await db.get('SELECT COUNT(*) as count FROM comments');
-    const dbSizeInMb = fs.statSync('database.sqlite').size / (1024 * 1024);
+    // Update test
+    const updateStart = Date.now() / 1000;
+    let updates = 0;
+    let updateDuration = 0;
+    while (updateDuration < maxDuration) {
+        const id = newRecords[Math.floor(Math.random() * newRecords.length)];
+        const newContent = Math.random().toString(36).substring(2, 2 + Math.floor(Math.random() * 91) + 10);
+        updateStmt.run(newContent, id);
+        updates++;
+        updateDuration = (Date.now() / 1000) - updateStart;
+    }
+    const updatesPerSecond = Math.round(updates / updateDuration);
 
-    // Delete the records inserted during this test and comments older than 10 minutes
-    const tenMinutesAgo = Math.floor(Date.now() / 1000) - 600;
-    await db.run(`DELETE FROM comments WHERE test_session = ? OR timestamp < ?`, [testSessionId, tenMinutesAgo]);
+    // Delete test
+    const deleteStart = Date.now() / 1000;
+    let deletes = 0;
+    let deleteDuration = 0;
+    while (deleteDuration < maxDuration && newRecords.length > 0) {
+        const id = newRecords.pop();
+        deleteStmt.run(id);
+        deletes++;
+        deleteDuration = (Date.now() / 1000) - deleteStart;
+    }
+    const deletesPerSecond = Math.round(deletes / deleteDuration);
 
-    const totalDuration = (Date.now() - startTime) / 1000;
+    // Clean up remaining test data
+    db.prepare('DELETE FROM comments WHERE test_session = ?').run(testSessionId);
+
+    const dbSizeInMb = Math.round(fs.statSync(databaseFile).size / (1024 * 1024) * 100) / 100;
+
+    const totalOperations = writes + reads + updates + deletes;
+    const operationsPerSecond = Math.round(totalOperations / (maxDuration * 4)); // Multiply by 4 because there are 4 test phases
 
     return {
-        dbSizeInMb: Math.round(dbSizeInMb * 100) / 100,
-        failureRate: Math.round((failures / writes) * 10000) / 100,
-        reads: readSampleSize,
-        readsPerSecond,
-        total: total.count,
+        dbSizeInMb,
+        totalOperations,
+        operationsPerSecond,
         writes,
         writesPerSecond,
-        writeTime: Math.round(writeTime * 100) / 100,
-        duration: Math.round(totalDuration * 100) / 100,
+        reads,
+        readsPerSecond,
+        updates,
+        updatesPerSecond,
+        deletes,
+        deletesPerSecond,
+        duration: Math.round((Date.now() / 1000 - writeStart) * 100) / 100,
     };
 }
 
-async function getServerSpecs() {
+function getServerSpecs() {
     const serverSpecs = {
         vCPUs: os.cpus().length,
         'CPU model': os.cpus()[0]?.model || 'Unknown',
